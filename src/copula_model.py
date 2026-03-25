@@ -1,144 +1,120 @@
-"""
-电网负荷分析模块 (load_analysis.py)
-负责根据城市的自然电力负荷 (Lnatural) 识别电网的峰区与谷区，
-并严格按照论文公式(11)与(12)计算各时段的充放电调度概率分布。
-"""
-
-import pandas as pd
 import numpy as np
-from typing import Tuple, Dict, List
+from scipy.optimize import minimize_scalar
+from scipy.interpolate import interp1d
+import warnings
 
-def identify_peak_valley_hours(
-    df_load: pd.DataFrame, 
-    load_col: str = 'Lnatural', 
-    time_col: str = 'Hour', 
-    n_hours: int = 5
-) -> Tuple[List[int], List[int], List[int]]:
-    """
-    识别电网负荷的峰区、谷区与平段。
-    依据论文设定：取自然电力负荷排名前五的时间区间为峰区，后五为谷区。
-    
-    :param df_load: 包含 24 小时自然负荷的 DataFrame
-    :param load_col: 负荷数值所在的列名
-    :param time_col: 时间(小时)所在的列名
-    :param n_hours: 峰区/谷区各自包含的小时数 (默认 5)
-    :return: (峰区小时列表, 谷区小时列表, 平段小时列表)
-    """
-    if len(df_load) != 24:
-        raise ValueError(f"输入的负荷数据应包含 24 小时的数据，当前长度为 {len(df_load)}")
+class FrankCopulaModel:
+    """Frank Copula 数学模型核心实现"""
+    def __init__(self, theta: float = -0.637):
+        """初始化模型参数，默认使用实证研究推荐值"""
+        self.theta = float(theta)
 
-    # 提取前 n_hours 个最大负荷作为峰区
-    peak_df = df_load.nlargest(n_hours, load_col)
-    peak_hours = peak_df[time_col].astype(int).tolist()
-    
-    # 提取前 n_hours 个最小负荷作为谷区
-    valley_df = df_load.nsmallest(n_hours, load_col)
-    valley_hours = valley_df[time_col].astype(int).tolist()
-    
-    # 剩余的 14 个小时即为平段 (C类用户出发时间如果在平段，可参与V2G)
-    all_hours = set(range(24))
-    flat_hours = list(all_hours - set(peak_hours) - set(valley_hours))
-    
-    return peak_hours, valley_hours, flat_hours
+    def log_density(self, u: np.ndarray, v: np.ndarray, theta: float = None) -> np.ndarray:
+        """计算 Frank Copula 对数密度函数 ln c_theta(u, v)"""
+        th = theta if theta is not None else self.theta
 
-def calculate_charging_probabilities(
-    df_load: pd.DataFrame, 
-    peak_hours: List[int], 
-    valley_hours: List[int], 
-    load_col: str = 'Lnatural', 
-    time_col: str = 'Hour'
-) -> Tuple[Dict[int, float], Dict[int, float]]:
-    """
-    计算峰区和谷区各时段的充电概率分布。
-    
-    - 峰区 (公式11): p_i = L_i / sum(L_j)，按负荷正向比例分配 (用于C类反向放电的时间权重)
-    - 谷区 (公式12): p_i = (1/L_i) / sum(1/L_j)，按负荷逆向加权分配 (用于A类谷区充电的时间权重)
-    
-    :param df_load: 包含 24 小时自然负荷的 DataFrame
-    :param peak_hours: 峰区小时列表
-    :param valley_hours: 谷区小时列表
-    :param load_col: 负荷数值所在的列名
-    :param time_col: 时间所在的列名
-    :return: (峰区各小时的概率字典, 谷区各小时的概率字典)
-    """
-    df_indexed = df_load.set_index(time_col)
-    
-    # 1. 计算峰区概率 (正向比例)
-    peak_loads = df_indexed.loc[peak_hours, load_col]
-    peak_total = peak_loads.sum()
-    peak_probs = (peak_loads / peak_total).round(4).to_dict()
-    
-    # 2. 计算谷区概率 (逆向加权 - 论文公式12)
-    # 负荷越小，其倒数越大，分配的概率(权重)就越高，填谷效果越好
-    valley_loads = df_indexed.loc[valley_hours, load_col]
-    valley_inv_loads = 1.0 / valley_loads
-    valley_inv_total = valley_inv_loads.sum()
-    valley_probs = (valley_inv_loads / valley_inv_total).round(4).to_dict()
-    
-    # 校验概率和是否为 1 (容忍浮点数舍入误差)
-    assert np.isclose(sum(peak_probs.values()), 1.0, atol=1e-3), "峰区概率和不为1"
-    assert np.isclose(sum(valley_probs.values()), 1.0, atol=1e-3), "谷区概率和不为1"
-    
-    return peak_probs, valley_probs
+        if abs(th) < 1e-5:
+            return np.zeros_like(u)
 
-def build_grid_context(df_load: pd.DataFrame, load_col: str = 'Lnatural') -> dict:
-    """
-    核心执行函数：整合上述步骤，为 V2G 模拟提供电网背景上下文 (Context)。
-    
-    :param df_load: 包含 24 小时自然负荷的 DataFrame
-    :param load_col: 负荷列名
-    :return: 包含峰谷时段划分及相应概率的字典结构
-    """
-    # 确保时间列名为 Hour，以防不一致
-    if 'hour' in df_load.columns and 'Hour' not in df_load.columns:
-        df_load = df_load.rename(columns={'hour': 'Hour'})
+        u = np.clip(u, 1e-6, 1.0 - 1e-6)
+        v = np.clip(v, 1e-6, 1.0 - 1e-6)
+
+        num = -th * (np.exp(-th) - 1) * np.exp(-th * (u + v))
+        den_term1 = np.exp(-th) - 1
+        den_term2 = (np.exp(-th * u) - 1) * (np.exp(-th * v) - 1)
+        den = (den_term1 + den_term2) ** 2
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            c_uv = num / den
+            log_c = np.log(np.clip(c_uv, 1e-10, None))
+
+        return log_c
+
+    def fit_mle(self, u: np.ndarray, v: np.ndarray) -> float:
+        """采用 MLE 拟合最优 theta 参数"""
+        def neg_log_likelihood(th):
+            if abs(th) < 1e-5:
+                return 1e10 
+            return -np.sum(self.log_density(u, v, th))
+
+        res = minimize_scalar(neg_log_likelihood, bounds=(-20, 20), method='bounded')
+
+        if res.success:
+            self.theta = res.x
+            return self.theta
+        else:
+            raise ValueError("Frank Copula MLE fitting failed.")
+
+    def sample_v_given_u(self, u: np.ndarray, n_samples: int = None) -> np.ndarray:
+        """条件抽样：利用 Frank Copula 解析逆生成 V ~ F_{V|U}(v|u)"""
+        th = self.theta
+
+        if np.isscalar(u):
+            u_arr = np.full(n_samples if n_samples else 1, u)
+        else:
+            u_arr = np.asarray(u)
+            if n_samples is not None and len(u_arr) != n_samples:
+                raise ValueError("Array u length mismatch with n_samples")
+
+        w = np.random.uniform(0, 1, size=len(u_arr))
+
+        if abs(th) < 1e-5:
+            return w 
+
+        exp_th = np.exp(-th)
+        exp_thu = np.exp(-th * u_arr)
+
+        term1 = w * (exp_th - 1)
+        term2 = exp_thu * (1 - w) + w
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ratio = term1 / term2
+            v = -(1.0 / th) * np.log(np.clip(1.0 + ratio, 1e-10, None))
+
+        return np.clip(v, 0.0, 1.0)
+
+
+class SpatiotemporalDependenceModel:
+    """基于 Frank Copula 的时空联合分布建模与抽样引擎"""
+    def __init__(self, time_pmf: np.ndarray, distance_kde, theta: float = -0.637):
+        """融合出发时间经验概率与行驶距离 KDE 模型"""
+        self.time_pmf = np.asarray(time_pmf)
+        self.time_cdf = np.cumsum(self.time_pmf)
+        self.time_cdf /= self.time_cdf[-1] 
+
+        self.kde = distance_kde
+        self.copula = FrankCopulaModel(theta=theta)
+
+        self._build_distance_interpolators()
+
+    def _build_distance_interpolators(self):
+        """数值积分构建距离 KDE 的 CDF 与逆映射插值器"""
+        d_grid = np.linspace(0, 1000, 5000)
+
+        log_pdf = self.kde.score_samples(d_grid.reshape(-1, 1))
+        pdf = np.exp(log_pdf)
+
+        cdf = np.cumsum(pdf) * (d_grid[1] - d_grid[0])
+        cdf = cdf / cdf[-1] 
+        cdf = np.maximum.accumulate(cdf)
+
+        self.f_d_interp = interp1d(d_grid, cdf, kind='linear', bounds_error=False, fill_value=(0.0, 1.0))
+        self.f_inv_d_interp = interp1d(cdf, d_grid, kind='linear', bounds_error=False, fill_value=(0.0, 1000.0))
+
+    def train_copula_parameter(self, raw_times: np.ndarray, raw_distances: np.ndarray) -> float:
+        """利用原始时空数据通过 MLE 重拟合 Copula 相关性参数"""
+        u_data = self.time_cdf[raw_times.astype(int)]
+        v_data = self.f_d_interp(raw_distances)
+
+        return self.copula.fit_mle(u_data, v_data)
+
+    def sample_distance_given_time(self, departure_times: np.ndarray) -> np.ndarray:
+        """核心业务接口：基于出发时间约束，经 Copula 映射抽样对应的行驶距离"""
+        dep_times = np.clip(np.asarray(departure_times).astype(int), 0, 23)
         
-    peak_hrs, valley_hrs, flat_hrs = identify_peak_valley_hours(df_load, load_col, time_col='Hour')
-    peak_probs, valley_probs = calculate_charging_probabilities(df_load, peak_hrs, valley_hrs, load_col, time_col='Hour')
-    
-    # 为了方便蒙特卡洛 np.random.choice 抽样，将概率字典转换为两个对齐的列表
-    # 峰区抽样参数
-    peak_choices = list(peak_probs.keys())
-    peak_weights = list(peak_probs.values())
-    
-    # 谷区抽样参数
-    valley_choices = list(valley_probs.keys())
-    valley_weights = list(valley_probs.values())
-    
-    return {
-        "peak_hours": peak_hrs,
-        "valley_hours": valley_hrs,
-        "flat_hours": flat_hrs,
-        "peak_sampling": {
-            "hours": peak_choices,
-            "probs": peak_weights
-        },
-        "valley_sampling": {
-            "hours": valley_choices,
-            "probs": valley_weights
-        }
-    }
-
-# ==========================================
-# 测试代码 (模块内独立运行时执行)
-# ==========================================
-if __name__ == "__main__":
-    # 模拟生成一个 24 小时的城市自然负荷数据用于测试
-    test_load_data = pd.DataFrame({
-        'Hour': list(range(24)),
-        # 简单模拟：白天低，晚上高，深夜极低
-        'Lnatural': [2000, 1900, 1800, 1850, 2100, 2500, 3000, 4000, 4500, 4200, 
-                     3800, 3500, 3600, 4000, 4800, 5500, 6000, 6500, 6800, 7000, 
-                     6900, 6200, 5000, 3000]
-    })
-    
-    grid_ctx = build_grid_context(test_load_data)
-    
-    print("【电网负荷分析结果】")
-    print(f"峰区时间 (Top 5): {grid_ctx['peak_hours']}")
-    print(f" -> 峰区充电概率分配: {dict(zip(grid_ctx['peak_sampling']['hours'], grid_ctx['peak_sampling']['probs']))}")
-    
-    print(f"\n谷区时间 (Bottom 5): {grid_ctx['valley_hours']}")
-    print(f" -> 谷区充电概率分配 (逆向加权): {dict(zip(grid_ctx['valley_sampling']['hours'], grid_ctx['valley_sampling']['probs']))}")
-    
-    print(f"\n平段时间: {grid_ctx['flat_hours']}")
+        u_arr = self.time_cdf[dep_times]
+        v_arr = self.copula.sample_v_given_u(u_arr)
+        
+        return self.f_inv_d_interp(v_arr)
